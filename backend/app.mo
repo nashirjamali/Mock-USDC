@@ -9,6 +9,7 @@ import Principal "mo:base/Principal";
 import Option "mo:base/Option";
 import Time "mo:base/Time";
 import Int "mo:base/Int";
+import Nat "mo:base/Nat";
 import Nat8 "mo:base/Nat8";
 import Nat64 "mo:base/Nat64";
 
@@ -180,6 +181,33 @@ persistent actor class Tokenmania() = this {
     // Effective fee for this transaction.
     fee : Tokens;
     timestamp : Timestamp;
+  };
+
+  // Transaction history types
+  public type TransactionWithId = {
+    id : TxIndex;
+    transaction : Transaction;
+  };
+
+  public type GetTransactionsRequest = {
+    start : TxIndex;
+    length : Nat;
+  };
+
+  public type GetTransactionsResponse = {
+    transactions : [TransactionWithId];
+    log_length : Nat;
+  };
+
+  public type GetAccountTransactionsRequest = {
+    account : Account;
+    start : ?TxIndex;
+    max_results : Nat;
+  };
+
+  public type GetAccountTransactionsResponse = {
+    transactions : [TransactionWithId];
+    oldest_tx_id : ?TxIndex;
   };
 
   public type DeduplicationError = {
@@ -397,7 +425,7 @@ persistent actor class Tokenmania() = this {
   var persistedLog : [Transaction] = [];
 
   system func preupgrade() {
-    persistedLog := log.toArray();
+    persistedLog := Buffer.toArray(log);
   };
 
   system func postupgrade() {
@@ -699,5 +727,94 @@ persistent actor class Tokenmania() = this {
 
   public query func icrc2_allowance({ account : Account; spender : Account }) : async Allowance {
     allowance(account, spender, Nat64.fromNat(Int.abs(Time.now())));
+  };
+
+  // Transaction history methods
+  public query func get_transactions(req : GetTransactionsRequest) : async GetTransactionsResponse {
+    let logArray = Buffer.toArray(log);
+    let logLength = logArray.size();
+    
+    // Validate start index
+    if (req.start >= logLength) {
+      return {
+        transactions = [];
+        log_length = logLength;
+      };
+    };
+    
+    // Calculate end index
+    let endIndex = Nat.min(req.start + req.length, logLength);
+    let transactions = Array.tabulate<TransactionWithId>(
+      endIndex - req.start,
+      func(i) {
+        let txIndex = req.start + i;
+        {
+          id = txIndex;
+          transaction = logArray[txIndex];
+        };
+      }
+    );
+    
+    {
+      transactions = transactions;
+      log_length = logLength;
+    };
+  };
+
+  public query func get_transaction(txId : TxIndex) : async ?Transaction {
+    let logArray = Buffer.toArray(log);
+    if (txId >= logArray.size()) {
+      return null;
+    };
+    ?logArray[txId];
+  };
+
+  public query func get_account_transactions(req : GetAccountTransactionsRequest) : async GetAccountTransactionsResponse {
+    let logArray = Buffer.toArray(log);
+    let logLength = logArray.size();
+    
+    // Find transactions for the account
+    var accountTransactions = Buffer.Buffer<TransactionWithId>(0);
+    var oldestTxId : ?TxIndex = null;
+    
+    // Start from the beginning or from the specified start index
+    let startIndex = Option.get(req.start, 0);
+    
+    var i = startIndex;
+    while (i < logLength) {
+      let tx = logArray[i];
+      let isRelevant = switch (tx.operation) {
+        case (#Transfer(args)) {
+          accountsEqual(args.from, req.account) or accountsEqual(args.to, req.account);
+        };
+        case (#Mint(args)) {
+          accountsEqual(args.to, req.account);
+        };
+        case (#Burn(args)) {
+          accountsEqual(args.from, req.account);
+        };
+        case (#Approve(args)) {
+          accountsEqual(args.from, req.account);
+        };
+      };
+      
+      if (isRelevant) {
+        if (accountTransactions.size() < req.max_results) {
+          accountTransactions.add({
+            id = i;
+            transaction = tx;
+          });
+        };
+        if (oldestTxId == null) {
+          oldestTxId := ?i;
+        };
+      };
+      i += 1;
+    };
+    
+    {
+      transactions = Buffer.toArray(accountTransactions);
+      oldest_tx_id = oldestTxId;
+    };
   };
 };
